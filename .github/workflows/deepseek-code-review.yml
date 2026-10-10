@@ -1,0 +1,396 @@
+name: DeepSeek Code Review
+
+# Advisory LLM review on every PR. Findings are posted as a COMMENT review, so the check
+# stays green and never blocks a merge.
+#
+# HARD-WON CONSTRAINTS (do not "simplify" these away):
+#
+#  * NO `response_format` — DeepSeek's API does not support
+#    {"type": "json_object"} and returns EMPTY or INVALID content when it is sent. The
+#    prompt asks for strict JSON and the parser tolerates fences, which is all that is
+#    needed. This parameter sat in every copy of this file and was the cause of the
+#    "Could not parse the model's JSON output" / empty-review failures.
+#  * NO thinking mode. DeepSeek v4 models default to thinking at reasoning_effort high,
+#    reasoning lands in `reasoning_content`, and `content` carries only the final answer —
+#    so a reasoning-heavy request can return EMPTY content. A structured findings list is a
+#    short-verdict task, not agentic work. `thinking: {type: disabled}` is sent
+#    unconditionally here ONLY because the URL below is hardcoded to api.deepseek.com;
+#    OpenRouter and OpenAI reject the param.
+#  * Keep `finish_reason` / content / reasoning / usage logged unconditionally. When this
+#    job goes wrong it goes wrong silently, and `finish_reason=length` versus `stop` is the
+#    entire diagnosis.
+#  * A failed review must be visible. The job exits non-zero AND leaves a short comment on
+#    the PR: a crashed review otherwise looks exactly like a clean review in the PR UI.
+#
+# CENTRAL COPY. This is the only real copy of the review; every repo runs it through a ~15-line
+# caller (templates/deepseek-code-review.yml) that triggers on pull_request and passes its
+# secrets with `secrets: inherit`. Fix the review HERE and every repo picks it up on its next PR.
+# The `github` context below (actor, event, repository) is the CALLER's, so the PR logic works
+# unchanged. Set a repo up with scripts/setup-repo.ps1.
+
+on:
+  workflow_call:
+    secrets:
+      # Optional on purpose: a missing key must reach the job's own check, which posts a visible
+      # failure note on the PR, rather than failing at call time with a bare red X.
+      DEEPSEEK_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  # The failure note is an issue comment on the PR conversation (see post_failure_note), which
+  # falls under this permission, not pull-requests:write.
+  issues: write
+
+jobs:
+  review:
+    # Skip Dependabot's own PRs.
+    #
+    # Not a preference — this job CANNOT work on them. A workflow triggered by Dependabot reads
+    # from a separate "Dependabot secrets" store rather than the repository's, so
+    # secrets.DEEPSEEK_API_KEY resolves to empty and the run trips its own "secret is not set"
+    # guard. The run log says it plainly: `Secret source: Dependabot`. Every Dependabot PR was
+    # therefore getting a red X for a reason that had nothing to do with its contents, and a check
+    # that is always red teaches you to ignore red — which defeats the point of having a gate.
+    #
+    # Nothing is lost by skipping: these PRs change a version number in package.json, which is not
+    # what an LLM reviewer is for. `check` still runs on them and is the signal that matters.
+    #
+    # Also require the PR to come from THIS repository, not a fork or anywhere else.
+    #
+    # For `pull_request`, GitHub takes the caller file from the PR head, and a branch pushed
+    # inside the repo does receive secrets. Today that is only the owner, so this changes nothing —
+    # it is here so that adding a collaborator later does not silently hand DEEPSEEK_API_KEY to
+    # whatever this file is edited to say on their branch. Forks never get secrets, so those PRs
+    # would fail this job's own key check anyway; skipping them cleanly is better than a red X.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Review PR with DeepSeek
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          # deepseek-v4-flash is RETIRED. Requests naming it are served by V4.1-Flash and billed
+          # at Flash price, silently, with no error and no code change — which is very likely why
+          # this job reviewed PRs happily earlier and then began returning empty content: the build
+          # behind the name changed to one with thinking on by default. Naming the live model makes
+          # that visible instead of ambient.
+          REVIEW_MODEL: deepseek-flash
+        run: |
+          python3 << 'PYEOF'
+          import os, sys, re, json, time, subprocess, urllib.request, urllib.error
+
+          # Defined up front so the failure-comment helper can reference them safely even when a
+          # config error fires before they are assigned.
+          repo = pr_number = commit = ""
+          gh_token = ""
+
+          def post_failure_note(msg):
+              # Best-effort comment on the PR. A red check is easy to ignore, and a review that
+              # never posted looks IDENTICAL to a review that found nothing — so say it in the
+              # conversation the user actually reads.
+              #
+              # Uses the ISSUE-comments endpoint rather than /pulls/{n}/reviews: a review with
+              # event=COMMENT and an empty `comments` array is a needless thing to get wrong when
+              # the note is not a review at all, and this endpoint has no event semantics to
+              # satisfy.
+              if not (gh_token and repo and pr_number):
+                  return
+              try:
+                  # Size the fence past the longest backtick run inside the message (a longer fence
+                  # than that run is what containment requires), so model output or an API error
+                  # containing ``` cannot break out and mangle the rest of the comment — and never
+                  # below 3, or the "fence" renders as inline code instead of a block.
+                  runs = re.findall(r"`+", msg)
+                  fence = "`" * max(3, (max(len(r) for r in runs) if runs else 0) + 1)
+                  note = ("## 🤖 DeepSeek Code Review\n\n"
+                          f"*Commit `{commit}` — ⚠️ the review did not run*\n\n"
+                          f"{fence}\n{msg[:600]}\n{fence}\n\n"
+                          "This is a CI/model failure, **not** a clean review. Re-run the job "
+                          "(`gh run rerun <id>`) or read the job log.")
+                  req_ = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+                      data=json.dumps({"body": note}).encode(),
+                      method="POST",
+                      headers={"Authorization": f"Bearer {gh_token}",
+                               "Accept": "application/vnd.github+json",
+                               "Content-Type": "application/json"})
+                  with urllib.request.urlopen(req_, timeout=30):
+                      pass
+                  print("Posted a failure note on the PR.")
+              except Exception as e:
+                  print(f"(could not post the failure note: {e})")
+
+          def fail(msg):
+              # A CONFIG/INFRA problem (bad key, API down, empty or unparseable output) — make it
+              # VISIBLE (red check + PR comment) so it never silently "passes" like before.
+              print(f"::error::{msg}")
+              post_failure_note(msg)
+              sys.exit(1)
+
+          # Read the workflow context BEFORE the API-key check: a missing key is exactly the kind
+          # of failure that should be reported on the PR, and a note cannot be posted without the
+          # token and the PR number.
+          gh_token  = os.environ.get("GITHUB_TOKEN")
+          if not gh_token:
+              # The one case that cannot be reported anywhere but the job log: no token means no
+              # way to comment.
+              print("::error::GITHUB_TOKEN is not available to the workflow.")
+              sys.exit(1)
+          repo      = os.environ.get("REPO", "")
+          pr_number = os.environ.get("PR_NUMBER", "")
+          base_ref  = os.environ.get("BASE_REF", "")
+          commit    = os.environ.get("COMMIT_SHA", "")[:7]
+          api_key   = os.environ.get("DEEPSEEK_API_KEY")
+          if not api_key:
+              fail("DEEPSEEK_API_KEY secret is not set on this repo.")
+          if not (repo and pr_number and base_ref):
+              fail("Missing PR context (REPO / PR_NUMBER / BASE_REF).")
+          model     = os.environ.get("REVIEW_MODEL", "deepseek-flash")  # live id, not the retired one
+
+          # --- Diff (only the PR's changes) ---
+          merge_base = subprocess.run(
+              ["git", "merge-base", f"origin/{base_ref}", "HEAD"],
+              capture_output=True, text=True).stdout.strip()
+          raw_diff = subprocess.run(
+              ["git", "diff", "--unified=3", f"{merge_base}...HEAD"],
+              capture_output=True, text=True).stdout
+          if not raw_diff.strip():
+              print("No diff — nothing to review.")
+              sys.exit(0)
+
+          # Annotate added lines with their NEW-file line number and record valid
+          # (file, line) targets so we can post inline comments GitHub will accept.
+          added = {}              # (path, new_line) -> code text
+          annotated = []
+          cur_file = None
+          new_ln = 0
+          for line in raw_diff.split("\n"):
+              if line.startswith("+++ b/"):
+                  cur_file = line[6:]; annotated.append(line); continue
+              if line.startswith("--- ") or line.startswith("diff --git") or \
+                 line.startswith("index ") or line.startswith("new file") or \
+                 line.startswith("deleted file") or line.startswith("rename "):
+                  annotated.append(line); continue
+              hm = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+              if hm:
+                  new_ln = int(hm.group(1)); annotated.append(line); continue
+              if line.startswith("+"):
+                  if cur_file:
+                      added[(cur_file, new_ln)] = line[1:]
+                  annotated.append(f"{new_ln}:+{line[1:]}")
+                  new_ln += 1
+              elif line.startswith("-"):
+                  annotated.append(f"    -{line[1:]}")   # removed: does not advance new-file line
+              else:
+                  annotated.append(f"{new_ln}: {line[1:] if line else ''}")
+                  new_ln += 1
+
+          diff_text = "\n".join(annotated)
+          # Back to 55000. It was briefly cut to 20000 on the theory that the model was
+          # over-reasoning because there was too much to read — measurement killed that: dropping
+          # the prompt from 14.5k to 6.5k tokens moved reasoning only from 54,667 to 52,326 chars.
+          # Reasoning length was independent of input size, so the cap was never the problem and
+          # cutting it only truncated reviews.
+          MAX = 55000
+          if len(diff_text) > MAX:
+              diff_text = diff_text[:MAX] + "\n...(diff truncated)"
+
+          prompt = (
+              "You are a senior engineer leaving review comments on a pull request, like a "
+              "careful colleague. Review the diff below. Every ADDED line is prefixed with "
+              "`<n>:+` where <n> is its line number in the new file; only review added lines.\n\n"
+              "Respond with STRICT JSON only (no markdown fences), shaped exactly like:\n"
+              '{"summary": "<1-2 sentence overall take>", "findings": ['
+              '{"file": "<path from the diff>", "line": <added line number>, '
+              '"severity": "BUG|SECURITY|PERF|STYLE", "comment": "<one concise sentence>"}]}\n\n'
+              "Only flag genuine problems; prefer correctness/security over nits. If the change "
+              "is fine, return an empty findings array. `file` must match a path in the diff and "
+              "`line` must be one of the prefixed added-line numbers.\n\nDiff:\n" + diff_text
+          )
+
+          payload = {
+              "model": model,
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.1,
+              # NOTE: no response_format here, deliberately. DeepSeek's API does not support
+              # {"type": "json_object"} and answers such a request with EMPTY or invalid content —
+              # which is exactly the failure this workflow used to die on. The prompt asks for
+              # strict JSON; the parser below tolerates fences and stray prose.
+              #
+              # Thinking mode is ON BY DEFAULT for DeepSeek v4 models at reasoning_effort "high",
+              # and it lands in `reasoning_content` while `content` holds only the final answer —
+              # so a reasoning-heavy request returns EMPTY content with finish_reason=length.
+              # `thinking: {type: disabled}` below is what fixed that. Safe to send unconditionally
+              # only because the URL is hardcoded to api.deepseek.com; OpenRouter and OpenAI
+              # reject the param.
+              "thinking": {"type": "disabled"},
+              # 8192 rather than 4000 or no cap: a findings list needs ~1-2k tokens, so this is
+              # nowhere near truncating a review, while still bounding a runaway response. (An
+              # earlier copy used 4000 *because* thinking was eating the budget; with thinking off
+              # that reasoning no longer applies.)
+              "max_tokens": 8192,
+          }
+
+          def call_model():
+              req = urllib.request.Request(
+                  "https://api.deepseek.com/v1/chat/completions",
+                  data=json.dumps(payload).encode(),
+                  headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=240) as resp:
+                      body = json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  # fail() calls sys.exit, so it never actually returns — the explicit `return None`
+                  # after it is for readers and static analysers, and the caller treats None as a
+                  # failure too. Belt and braces on the one path where a crash would skip the
+                  # failure note.
+                  fail(f"DeepSeek API HTTP {e.code}: {e.read()[:200].decode(errors='ignore')}")
+                  return None
+              except Exception as e:
+                  fail(f"DeepSeek API call failed: {e}")
+                  return None
+
+              # `or [{}]`, not `.get("choices", [{}])`: an explicit empty list would make the
+              # default moot and the [0] below would raise IndexError — crashing past fail() and
+              # therefore posting NO failure note, which is the one outcome this file exists to
+              # prevent.
+              choice = (body.get("choices") or [{}])[0]
+              msg = choice.get("message", {}) or {}
+              content = msg.get("content") or ""
+              # Logged unconditionally, not only on failure: when this job goes wrong it goes wrong
+              # silently, and "finish_reason: length" versus "stop" is the whole diagnosis.
+              print(
+                  f"finish_reason={choice.get('finish_reason')} "
+                  f"content_chars={len(content)} "
+                  f"reasoning_chars={len(msg.get('reasoning_content') or '')} "
+                  f"usage={json.dumps(body.get('usage', {}))}"
+              )
+              return content
+
+          content = call_model()
+          if not content or not content.strip():
+              # One retry before declaring failure: a single empty response is not a verdict, and
+              # re-running the identical request has come back with content before. A few seconds
+              # of backoff because an empty answer is usually a momentary server-side hiccup
+              # rather than something about the request itself. (No jitter: there is exactly one
+              # retry from a single job, so there is no thundering herd to spread out.)
+              print("Empty content — retrying once.")
+              time.sleep(3)
+              content = call_model()
+          if not content or not content.strip():
+              fail(
+                  "DeepSeek returned EMPTY content twice. Check the finish_reason line logged "
+                  "above: 'length' with a large reasoning_chars means thinking mode consumed the "
+                  "whole budget and never produced an answer — confirm the payload still carries "
+                  "thinking:{type:'disabled'} and that no response_format was reintroduced. "
+                  "Neither raising max_tokens nor shrinking the diff fixes that; both were tried."
+              )
+
+          def parse_json(s):
+              s = s.strip()
+              if s.startswith("```"):
+                  s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
+                  s = re.sub(r"\n?```$", "", s).strip()
+              try:
+                  return json.loads(s)
+              except Exception:
+                  m = re.search(r"\{.*\}", s, re.DOTALL)
+                  if m:
+                      try:
+                          return json.loads(m.group(0))
+                      except Exception:
+                          return None
+              return None
+
+          data = parse_json(content)
+          if data is None:
+              print("Model output (unparseable):\n" + content[:600])
+              fail("Could not parse the model's JSON output.")
+
+          summary  = str(data.get("summary", "")).strip()
+          findings = data.get("findings") or []
+          print(f"{len(findings)} finding(s)")
+
+          SEV = {"BUG": "🐛 BUG", "SECURITY": "🔒 SECURITY", "SEC": "🔒 SECURITY",
+                 "PERF": "⚡ PERF", "STYLE": "🎨 STYLE"}
+          inline, unmapped = [], []
+          for f in findings:
+              if not isinstance(f, dict):
+                  continue
+              path = str(f.get("file", "")).lstrip("/")
+              ln   = f.get("line")
+              sev  = SEV.get(str(f.get("severity", "STYLE")).upper(), "🎨 STYLE")
+              cm   = str(f.get("comment", "")).strip()
+              if not cm:
+                  continue
+              body = f"**{sev}** {cm}"
+              if path and isinstance(ln, int) and (path, ln) in added:
+                  inline.append({"path": path, "line": ln, "side": "RIGHT", "body": body})
+              else:
+                  loc = f"`{path}`" + (f":{ln}" if ln else "")
+                  unmapped.append(f"- {loc} — {body}")
+
+          # Advisory review body. event=COMMENT never blocks the PR — findings are advisory,
+          # exactly like Codex review, so the check still PASSES even when issues are found.
+          header = "## 🤖 DeepSeek Code Review\n\n"
+          if commit:
+              header += f"*Commit `{commit}` · model `{model}`*\n\n"
+          if not findings:
+              header += (summary + "\n\n" if summary else "") + "No issues found. ✅"
+          else:
+              if summary:
+                  header += summary + "\n\n"
+              header += f"**{len(findings)} finding(s)** — advisory, not blocking."
+              if unmapped:
+                  header += "\n\n" + "\n".join(unmapped)
+
+          def post_review(comments):
+              review = {"body": header, "event": "COMMENT", "comments": comments}
+              # when we fall back to summary-only, fold inline findings into the body
+              if not comments and inline:
+                  extra = "\n".join(f"- `{c['path']}`:{c['line']} — {c['body']}" for c in inline)
+                  review["body"] = header + ("\n\n" if "finding" in header else "") + extra
+              data_ = json.dumps(review).encode()
+              r = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews",
+                  data=data_, method="POST",
+                  headers={"Authorization": f"Bearer {gh_token}",
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json"})
+              # Closed rather than left to the process exit: the response object is a live
+              # connection until it is.
+              with urllib.request.urlopen(r, timeout=30):
+                  pass
+
+          try:
+              post_review(inline)
+              print("Review posted.")
+          except urllib.error.HTTPError as e:
+              # Inline anchoring can still be rejected (422) for edge cases — fall back to a
+              # summary-only review so findings always land, rather than failing the run.
+              detail = e.read()[:300].decode(errors="ignore")
+              print(f"Inline review rejected (HTTP {e.code}): {detail}")
+              try:
+                  post_review([])
+                  print("Posted summary-only review (fallback).")
+              except Exception as e2:
+                  fail(f"GitHub review POST failed: {e2}")
+          except Exception as e:
+              fail(f"GitHub review POST failed: {e}")
+          PYEOF
