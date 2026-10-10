@@ -111,9 +111,14 @@ Write-Host "== $Repo (default branch: $branch)"
 
 # --- 1. Review caller ---
 $caller = [IO.File]::ReadAllText((Resolve-Path $Template))
-$existing = gh api "repos/$Repo/contents/$($WorkflowPath)?ref=$branch" 2>$null | ConvertFrom-Json
-$hasFile = ($LASTEXITCODE -eq 0) -and $existing.sha
-$LASTEXITCODE = 0
+# A 404 here just means "not installed yet". Windows PowerShell 5.1 turns a native command's
+# stderr into a terminating error under 'Stop', even with 2>$null, so relax it for this call.
+$ErrorActionPreference = 'Continue'
+$existingJson = gh api "repos/$Repo/contents/$($WorkflowPath)?ref=$branch" 2>$null
+$found = $LASTEXITCODE -eq 0
+$ErrorActionPreference = 'Stop'
+$existing = if ($found -and $existingJson) { $existingJson | ConvertFrom-Json } else { $null }
+$hasFile = [bool]($existing -and $existing.sha)
 
 $current = $null
 if ($hasFile) {
