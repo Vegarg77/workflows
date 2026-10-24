@@ -17,12 +17,15 @@
   .\setup-repo.ps1 localplantcalendar
   .\setup-repo.ps1 Vegarg77/ai-rooms
   .\setup-repo.ps1 -SetKey          # store or replace the key only
+  .\setup-repo.ps1 MasterTracker -ResetSecret   # re-push the key to a repo that already has it
 #>
 param(
     [Parameter(Position = 0)] [string] $Repo,
     [switch] $SetKey,
     # Overwrite a review workflow that is neither the caller nor the old full copy.
-    [switch] $Force
+    [switch] $Force,
+    # Re-set DEEPSEEK_API_KEY even if the repo already has it.
+    [switch] $ResetSecret
 )
 
 $ErrorActionPreference = 'Stop'
@@ -143,10 +146,15 @@ if ($hasFile -and ($current -replace "`r", '') -eq ($caller -replace "`r", '')) 
 # --- 2. API key secret ---
 $secrets = gh secret list -R $Repo --json name -q '.[].name'
 Assert-Gh 'listing secrets'
-if ($secrets -contains 'DEEPSEEK_API_KEY') {
+if ($secrets -contains 'DEEPSEEK_API_KEY' -and -not $ResetSecret) {
     Write-Host 'DEEPSEEK_API_KEY: already set.'
 } else {
-    Get-Key | gh secret set DEEPSEEK_API_KEY -R $Repo
+    # Windows PowerShell pipes to native programs in Console.InputEncoding, which here writes a
+    # UTF-8 BOM; that BOM ends up at the front of the secret and breaks the Authorization header.
+    $prevEnc = [Console]::InputEncoding
+    [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false
+    try { Get-Key | gh secret set DEEPSEEK_API_KEY -R $Repo }
+    finally { [Console]::InputEncoding = $prevEnc }
     Assert-Gh 'setting DEEPSEEK_API_KEY'
     Write-Host 'DEEPSEEK_API_KEY: set.'
 }
